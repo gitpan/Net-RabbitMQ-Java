@@ -3,7 +3,7 @@ package Net::RabbitMQ::Java;
 use strict;
 use warnings;
 
-our $VERSION = '2.030101';
+our $VERSION = '2.030102';
 
 use Data::UUID;
 use File::ShareDir qw(dist_dir);
@@ -37,42 +37,48 @@ sub method_with_3_args_or_map {
     
     return $orig->(@_);
 }
-sub decoding_accessor (@) {
+sub decoding_accessor {
     my $decoder = shift;
-    my $orig = shift;
-    return $decoder->($orig->(@_));
+    return sub {
+        my $orig = shift;
+        return $decoder->($orig->(@_));
+    };
 }
-sub encoding_setter (@) {
+sub encoding_setter {
     my $encoder = shift;
-    my $orig = shift;
-    return $orig->($encoder->(@_));
+    return sub {
+        my $orig = shift;
+        return $orig->($encoder->(@_));
+    };
 }
-sub callback_setter (@) {
-    my $type = shift;
-    my $decode_coderef = @_ == 4 ? shift : sub {@_}; # second arg is optional
-    my ($orig, $obj, $coderef) = @_;
+sub callback_setter {
+    my ($type, $decode_coderef) = @_;
+    $decode_coderef ||= sub {@_}; # second arg is optional
+    return sub {
+        my ($orig, $obj, $coderef) = @_;
     
-    # generate the callback unique identifier
-    my $callback_id = "${type}_${obj}_" . Data::UUID->new->create_hex;
-    
-    # create a Java helper listener
-    my $listener_obj = "Net::RabbitMQ::Java::Helper::$type"->new($Helper, $callback_id);
-    $orig->($obj, $listener_obj);
-    my $callbackCaller = $listener_obj->getCallbackCaller;
-    
-    # save the callback in Perl-land
-    $coderef ||= sub {};
-    $callbacks{$callback_id} = [
-        $callbackCaller, 
-        sub { $coderef->($decode_coderef->(@_)) }
-    ];
-    
-    # save an index of callbacks added to channels, so that we
-    # can remove them when channel objects get destroyed
-    $obj_callbacks{"$obj"} ||= [];
-    push @{ $obj_callbacks{"$obj"} }, $callback_id;
-    
-    return $callbackCaller;
+        # generate the callback unique identifier
+        my $callback_id = "${type}_${obj}_" . Data::UUID->new->create_hex;
+        
+        # create a Java helper listener
+        my $listener_obj = "Net::RabbitMQ::Java::Helper::$type"->new($Helper, $callback_id);
+        $orig->($obj, $listener_obj);
+        my $callbackCaller = $listener_obj->getCallbackCaller;
+        
+        # save the callback in Perl-land
+        $coderef ||= sub {};
+        $callbacks{$callback_id} = [
+            $callbackCaller, 
+            sub { $coderef->($decode_coderef->(@_)) }
+        ];
+        
+        # save an index of callbacks added to channels, so that we
+        # can remove them when channel objects get destroyed
+        $obj_callbacks{"$obj"} ||= [];
+        push @{ $obj_callbacks{"$obj"} }, $callback_id;
+        
+        return $callbackCaller;
+    };
 }
 sub destroy_callbacks {
     my $self = shift;
@@ -89,12 +95,12 @@ sub encode_ByteArray ($) {
     # this is very inefficient; an idea would be to 
     # convert to hexadecimal (base64?) and pass it as a String
     # to a Java helper object to call .getBytes() on
-    return [ unpack("C*", $string) ];
+    return [ unpack("c*", $string) ];
 }
 
 sub decode_ByteArray ($) {
     my $byteArray = shift;
-    return pack("C*", @$byteArray);
+    return pack("c*", @$byteArray);
 }
 
 sub encode_Map ($) {
@@ -147,8 +153,11 @@ sub encode_BasicProperties ($) {
 }
 
 # main code
+my $inited = 0;
 sub init {
     my ($class, %params) = @_;
+    return if $inited;
+    $inited = 1;
     
     # load Java code
     my $share_dir = dist_dir('Net-RabbitMQ-Java');
@@ -216,26 +225,24 @@ sub init {
         'impl::ChannelN::queueDeclare'      => \&method_with_3_args_or_map,
         'impl::ChannelN::queueUnbind'       => \&method_with_3_args_or_map,
         
-        'impl::ChannelN::setReturnListener' => sub {
-            callback_setter 'ReturnListener', sub {
-                # last argument is message body
-                splice @_, -1, 1, decode_ByteArray $_[-1];
-                @_;
-            }, @_;
-        },
-        'impl::ChannelN::setConfirmListener'        => sub { callback_setter 'ConfirmListener', @_ },
-        'impl::ChannelN::setFlowListener'           => sub { callback_setter 'FlowListener', @_ },
-        'impl::ChannelN::addShutdownListener'       => sub { callback_setter 'ShutdownListener', @_ },
-        'impl::AMQConnection::addShutdownListener'  => sub { callback_setter 'ShutdownListener', @_ },
+        'impl::ChannelN::setReturnListener' => callback_setter('ReturnListener', sub {
+            # last argument is message body
+            splice @_, -1, 1, decode_ByteArray $_[-1];
+            @_;
+        }),
+        'impl::ChannelN::setConfirmListener'        => callback_setter('ConfirmListener'),
+        'impl::ChannelN::setFlowListener'           => callback_setter('FlowListener'),
+        'impl::ChannelN::addShutdownListener'       => callback_setter('ShutdownListener'),
+        'impl::AMQConnection::addShutdownListener'  => callback_setter('ShutdownListener'),
         
-        'ConnectionFactory::getClientProperties'    => sub { decoding_accessor \&decode_Map, @_ },
-        'impl::AMQConnection::getClientProperties'  => sub { decoding_accessor \&decode_Map, @_ },
-        'impl::AMQConnection::getServerProperties'  => sub { decoding_accessor \&decode_Map, @_ },
-        'QueueingConsumer::Delivery::getBody'       => sub { decoding_accessor \&decode_ByteArray, @_ },
-        'GetResponse::getBody'                      => sub { decoding_accessor \&decode_ByteArray, @_ },
-        'AMQP::BasicProperties::getHeaders'         => sub { decoding_accessor \&decode_Map, @_ },
+        'ConnectionFactory::getClientProperties'    => decoding_accessor(\&decode_Map),
+        'impl::AMQConnection::getClientProperties'  => decoding_accessor(\&decode_Map),
+        'impl::AMQConnection::getServerProperties'  => decoding_accessor(\&decode_Map),
+        'QueueingConsumer::Delivery::getBody'       => decoding_accessor(\&decode_ByteArray),
+        'GetResponse::getBody'                      => decoding_accessor(\&decode_ByteArray),
+        'AMQP::BasicProperties::getHeaders'         => decoding_accessor(\&decode_Map),
         
-        'ConnectionFactory::setClientProperties'    => sub { encoding_setter \&encode_Map, @_ },
+        'ConnectionFactory::setClientProperties'    => encoding_setter(\&encode_Map),
     );
     my %new_subs = (
         'impl::ChannelN::DESTROY'       => \&destroy_callbacks,
@@ -393,8 +400,8 @@ There are few classes you need to instantiate directly:
 
 =head1 CALLING METHODS
 
-See the client library original documentation to learn method signatures. This 
-module will take care of casting data types. You only need to take care to the 
+See the client library original documentation to learn about method signatures. This 
+module will take care of casting data types. You only need to take care of the 
 number of arguments which must match what the library is expecting, even if you 
 want to pass null values:
 
@@ -410,7 +417,7 @@ argument lists).
 
 In order to provide you with a better interface to the underlying library, some 
 methods are overloaded and augmented. Thus, for these methods you should combine
-the RabbitMQ client library with the following instructions:
+the RabbitMQ client library docs with the following instructions:
 
 =over 4
 
@@ -482,7 +489,7 @@ on them:
 
 This module provides some glue to use Perl code as callbacks for reacting to events
 thrown by the RabbitMQ client library. The library itself is multi-threading; however
-there's currently no way to share Java object between multiple Perl threads, so your 
+there's currently no way to share Java objects between multiple Perl threads, so your 
 application will need to have one connection per Perl thread. Thus, your callbacks
 will be executed in a single-threaded environment as soon as you want. The Java library
 will catch the events in the background and will put them in a queue so that you can
@@ -622,12 +629,12 @@ Some things will need future work:
 
 =over 4
 
-=item Implementation of the RpcClient class
+=item I<Implementation of the RpcClient class>
 
 It should be enabled explicitely by the user, so that we don't load an extra Java class that 
 we don't use.
 
-=item Full async support
+=item I<Full async support>
 
 An async mode would be useful to allow implementation with event-based frameworks such as 
 L<POE> and others. This requires a non-blocking behaviour of AMQP sync commands. It could
@@ -636,11 +643,11 @@ should accept a coderef as last argument and return immediately; the Java client
 should receive the C<tx.commit-ok> response in a separate Java thread and enqueue the 
 callback call.
 
-=item Compile java Helper code at install time
+=item I<Compile java Helper code at install time>
 
 This would speed up start-up.
 
-=item Provide named arguments to all methods
+=item I<Provide named arguments to all methods>
 
 This should be done at least on Channel methods. This module should then decide which Java
 signature to call.

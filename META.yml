@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               Net-RabbitMQ-Java
-version:            2.030101
+version:            2.030102
 abstract:           Perl bindings for the RabbitMQ Java AMQP client library
 author:
     - Alessandro Ranellucci <aar@cpan.org>
